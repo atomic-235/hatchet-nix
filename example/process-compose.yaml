@@ -1,0 +1,113 @@
+version: "0.5"
+
+# Local stack: Postgres + hatchet-lite, no containers.
+# Run from the repo root inside the dev shell:
+#
+#   nix develop
+#   cd example && process-compose up -p 8090
+#
+# Dashboard: http://localhost:8888
+# `-p 8090` matters: process-compose's own server defaults to 8080, which
+# hatchet-lite uses for its API.
+
+name: hatchet-lite-local
+log_level: info
+log_length: 500
+shell:
+  shell_command: "bash"
+  shell_argument: "-c"
+
+environment:
+  - "PGDATA=./data/pg"
+  - "DATABASE_URL=postgresql://hatchet@127.0.0.1:5433/hatchet?sslmode=disable"
+  - "SERVER_URL=http://localhost:8888"
+  - "SERVER_GRPC_BIND_ADDRESS=0.0.0.0"
+  - "SERVER_GRPC_PORT=7077"
+  - "SERVER_GRPC_INSECURE=true"
+  - "SERVER_GRPC_BROADCAST_ADDRESS=localhost:7077"
+  - "SERVER_INTERNAL_CLIENT_INTERNAL_GRPC_BROADCAST_ADDRESS=localhost:7077"
+  - "SERVER_AUTH_COOKIE_DOMAIN=localhost"
+  - "SERVER_AUTH_COOKIE_INSECURE=true"
+  - "SERVER_AUTH_SET_EMAIL_VERIFIED=true"
+
+processes:
+  initdb:
+    description: "initdb - create the cluster once"
+    working_dir: .
+    command: "test -d ./data/pg || initdb -D ./data/pg -U hatchet --auth=trust -E UTF8"
+    availability:
+      restart: "no"
+
+  postgres:
+    description: "Postgres 17 - database and queue"
+    working_dir: .
+    command: "postgres -D ./data/pg -p 5433 -k . -c timezone=UTC -c log_timezone=UTC"
+    depends_on:
+      initdb:
+        condition: process_completed_successfully
+    readiness_probe:
+      exec:
+        command: "pg_isready -h 127.0.0.1 -p 5433 -U hatchet"
+      initial_delay_seconds: 1
+      period_seconds: 1
+      timeout_seconds: 2
+      failure_threshold: 60
+    shutdown:
+      command: "pg_ctl -D ./data/pg -m fast stop"
+      timeout_seconds: 15
+
+  db-create:
+    description: "create the hatchet database if missing"
+    working_dir: .
+    command: "createdb -h 127.0.0.1 -p 5433 -U hatchet hatchet || true"
+    depends_on:
+      postgres:
+        condition: process_healthy
+    availability:
+      restart: "no"
+
+  migrate:
+    description: "hatchet-migrate - schema migrations"
+    working_dir: .
+    command: "hatchet-migrate"
+    depends_on:
+      db-create:
+        condition: process_completed_successfully
+    availability:
+      restart: "no"
+
+  seed:
+    description: "hatchet-admin quickstart + worker token"
+    working_dir: .
+    command: |
+      set -euo pipefail
+      hatchet-admin quickstart --skip certs --generated-config-dir ./data/config --overwrite=false
+      if hatchet-admin authdisabled; then
+        if [ ! -s ./data/config/authdisabled-token ]; then
+          hatchet-admin token create --config ./data/config --name authdisabled-default > ./data/config/authdisabled-token
+        fi
+        echo "worker token: ./data/config/authdisabled-token"
+      fi
+    depends_on:
+      migrate:
+        condition: process_completed_successfully
+    availability:
+      restart: "no"
+
+  hatchet:
+    description: "hatchet-lite - engine + API + dashboard"
+    working_dir: .
+    command: "hatchet-lite --config ./data/config"
+    depends_on:
+      seed:
+        condition: process_completed_successfully
+    readiness_probe:
+      http_get:
+        host: 127.0.0.1
+        scheme: http
+        path: /
+        port: 8888
+      initial_delay_seconds: 2
+      period_seconds: 30
+      timeout_seconds: 2
+      failure_threshold: 60
